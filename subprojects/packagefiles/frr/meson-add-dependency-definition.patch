@@ -1,0 +1,91 @@
+From 9c78323cf979b6dedfb37140250f655a63592d8f Mon Sep 17 00:00:00 2001
+From: Maxime Leroy <maxime@leroys.fr>
+Date: Fri, 16 May 2025 16:56:22 +0200
+Subject: [PATCH] meson add dependency definition
+
+Signed-off-by: Maxime Leroy <maxime@leroys.fr>
+---
+ meson.build | 71 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 71 insertions(+)
+ create mode 100644 meson.build
+
+diff --git a/meson.build b/meson.build
+new file mode 100644
+index 0000000..57d7c94
+--- /dev/null
++++ b/meson.build
+@@ -0,0 +1,71 @@
++project('frr', 'c', version : '10.3', license : 'GPL-2.0-or-later')
++
++frr_srcdir   = meson.source_root() / 'subprojects' / 'frr'
++frr_builddir = meson.build_root()  / 'subprojects' / 'frr'
++
++# make sure the out-of-tree build directory exists
++run_command('mkdir', '-p', frr_builddir, check : true)
++
++bootstrap = custom_target(
++  'bootstrap',
++  output  : '.bootstrap-stamp',
++  command : [
++    'sh', '-c',
++    'autoreconf -is -Wall,no-override "' + frr_srcdir + '" && touch "@OUTPUT@"'
++  ],
++)
++
++configure_stamp = '.configure-stamp'
++moduledir = join_paths(get_option('prefix'), get_option('libdir'), 'frr/modules')
++
++configure = custom_target(
++  'configure',
++  output  : configure_stamp,
++  command : [
++    'sh', '-c',
++    'cd "' + frr_builddir + '" && ' +
++    '"' + frr_srcdir + '/configure" ' +
++    '--prefix=' + get_option('prefix') + ' ' +
++    '--with-moduledir="' + moduledir + '" ' +
++    '--disable-doc ' +
++    '--disable-ripd --disable-ripngd --disable-ospfd --disable-ospf6d ' +
++    '--disable-ldpd --disable-nhrpd --disable-eigrpd --disable-babeld --disable-watchfrr ' +
++    '--disable-isisd --disable-pimd --disable-pim6d --disable-pbrd --disable-fabricd ' +
++    '--disable-vrrpd --disable-pathd --disable-ospfapi --disable-ospfclient ' +
++    '--disable-bfdd --disable-python-runtime ' +
++    '&&  touch "' + configure_stamp + '"'
++  ],
++  depends : bootstrap,
++)
++
++build_stamp = '.build-stamp'
++
++build = custom_target(
++  'build',
++  output  : build_stamp,
++  command : [
++    'sh', '-c',
++    'cd "' + frr_builddir + '" && make -j && touch "' + build_stamp + '"'
++  ],
++  depends          : configure,
++  build_by_default : true,
++)
++
++frr_builddir = meson.build_root() / 'subprojects' / 'frr'
++frr_libdir   = frr_builddir / 'lib' / '.libs'
++
++frr_dep = declare_dependency(
++  include_directories: include_directories('.', 'lib', 'zebra'),
++  compile_args: [
++    '-fms-extensions',
++    '-I' + frr_builddir
++  ],
++  link_args: [
++    '-L' + frr_libdir,
++    '-lfrr',
++  ],
++  sources: [build],
++  variables: {
++    'moduledir': moduledir,
++  }
++)
+-- 
+2.43.0
+
