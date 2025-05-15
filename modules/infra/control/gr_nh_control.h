@@ -16,6 +16,23 @@ extern struct gr_nexthop_config nh_conf;
 int nexthop_config_set(const struct gr_nexthop_config *);
 unsigned nexthop_used_count(void);
 
+#define GR_MAX_PRIV 16
+#define GR_ALIGNED_PRIV 8
+
+// Defines a struct named `type` with the given members (__VA_ARGS__),
+// tags it __may_alias__ and aligned(GR_ALIGNED_PRIV),
+// and emits two compile‐time checks:
+//
+//   • sizeof(struct type) <= GR_MAX_PRIV
+//   • alignof(struct type) <= GR_ALIGNED_PRIV
+//
+#define GR_PRIV_STRUCT(type, ...)					\
+	struct type {							\
+		__VA_ARGS__						\
+	} __attribute__((__may_alias__, aligned(GR_ALIGNED_PRIV)));     \
+	static_assert(sizeof(struct type) <= GR_MAX_PRIV);		\
+	static_assert(__alignof__(struct type) <= GR_ALIGNED_PRIV)
+
 struct __rte_cache_aligned nexthop {
 	BASE(gr_nexthop);
 
@@ -28,6 +45,8 @@ struct __rte_cache_aligned nexthop {
 	// packets waiting for address resolution
 	struct rte_mbuf *held_pkts_head;
 	struct rte_mbuf *held_pkts_tail;
+
+	uint8_t priv[GR_MAX_PRIV] __rte_aligned(GR_ALIGNED_PRIV);
 };
 
 struct hoplist {
