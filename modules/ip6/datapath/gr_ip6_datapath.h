@@ -34,6 +34,8 @@ GR_MBUF_PRIV_DATA_TYPE(ndp_na_output_mbuf_data, {
 });
 
 void ip6_input_local_add_proto(uint8_t proto, const char *next_node);
+int ip6_fill_local_data(const struct rte_ipv6_hdr *ip, const rte_edge_t *edges,
+			struct rte_mbuf *m);
 void ip6_output_register_interface_type(gr_iface_type_t type, const char *next_node);
 void ip6_output_register_nexthop_type(gr_nh_type_t type, const char *next_node);
 int nh6_solicit(struct nexthop *nh);

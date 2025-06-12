@@ -26,6 +26,46 @@ void ip6_input_local_add_proto(uint8_t proto, const char *next_node) {
 	edges[proto] = gr_node_attach_parent("ip6_input_local", next_node);
 }
 
+int
+ip6_fill_local_data(const struct rte_ipv6_hdr *ip, const rte_edge_t *edges,
+		    struct rte_mbuf *m)
+{
+	struct ip6_local_mbuf_data *d;
+	const struct iface *iface;
+	rte_edge_t edge;
+
+	iface = ip6_output_mbuf_data(m)->iface;
+	d = ip6_local_mbuf_data(m);
+	d->src = ip->src_addr;
+	d->dst = ip->dst_addr;
+	d->len = rte_be_to_cpu_16(ip->payload_len);
+	d->hop_limit = ip->hop_limits;
+	d->proto = ip->proto;
+	d->iface = iface;
+	d->ext_offset = sizeof(*ip);
+
+	// advance through IPv6 extension headers until we find a registered handler
+	while ((edge = edges[d->proto]) == UNKNOWN_PROTO) {
+		size_t ext_size = 0;
+		const uint8_t *ext;
+		uint8_t _ext[2];
+		int next_proto;
+
+		ext = rte_pktmbuf_read(m, d->ext_offset, sizeof(_ext), _ext);
+		if (ext == NULL)
+			return -1;
+
+		next_proto = rte_ipv6_get_next_ext(ext, d->proto, &ext_size);
+		if (next_proto < 0)
+			break; // end of extension headers
+		d->ext_offset += ext_size;
+		d->len -= ext_size;
+		d->proto = next_proto;
+	};
+
+	return edge;
+}
+
 static uint16_t ip6_input_local_process(
 	struct rte_graph *graph,
 	struct rte_node *node,
@@ -33,11 +73,11 @@ static uint16_t ip6_input_local_process(
 	uint16_t nb_objs
 ) {
 	struct ip6_local_mbuf_data *d;
-	const struct iface *iface;
 	struct rte_ipv6_hdr *ip;
 	struct rte_mbuf *m;
 	rte_edge_t edge;
 	uint16_t i;
+	int ret;
 
 	for (i = 0; i < nb_objs; i++) {
 		m = objs[i];
@@ -46,40 +86,17 @@ static uint16_t ip6_input_local_process(
 		if (gr_mbuf_is_traced(m))
 			gr_mbuf_trace_add(m, node, 0);
 
-		// prepare ip local data
-		iface = ip6_output_mbuf_data(m)->iface;
-		d = ip6_local_mbuf_data(m);
-		d->src = ip->src_addr;
-		d->dst = ip->dst_addr;
-		d->len = rte_be_to_cpu_16(ip->payload_len);
-		d->hop_limit = ip->hop_limits;
-		d->proto = ip->proto;
-		d->iface = iface;
-		d->ext_offset = sizeof(*ip);
-
-		// advance through IPv6 extension headers until we find a registered handler
-		while ((edge = edges[d->proto]) == UNKNOWN_PROTO) {
-			size_t ext_size = 0;
-			const uint8_t *ext;
-			uint8_t _ext[2];
-			int next_proto;
-
-			ext = rte_pktmbuf_read(m, d->ext_offset, sizeof(_ext), _ext);
-			if (ext == NULL) {
-				edge = ERROR;
-				goto next;
-			}
-			next_proto = rte_ipv6_get_next_ext(ext, d->proto, &ext_size);
-			if (next_proto < 0)
-				break; // end of extension headers
-			d->ext_offset += ext_size;
-			d->len -= ext_size;
-			d->proto = next_proto;
-		};
+		ret = ip6_fill_local_data(ip, edges, m);
+		if (ret < 0) {
+			edge = ERROR;
+			goto next;
+		}
+		edge = ret;
 
 		if (edge == UNKNOWN_PROTO)
 			goto next;
 
+		d = ip6_local_mbuf_data(m);
 		switch (d->proto) {
 		case IPPROTO_AH:
 		case IPPROTO_HOPOPTS:
