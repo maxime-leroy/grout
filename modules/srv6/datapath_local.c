@@ -46,8 +46,10 @@ struct trace_srv6_data {
 	uint16_t out_vrf_id;
 };
 
-static int trace_srv6_format(char *buf, size_t len, const void *data, size_t /*data_len*/) {
+static int trace_srv6_format(char *buf, size_t len, const void *data, size_t /*data_len*/)
+{
 	const struct trace_srv6_data *t = data;
+
 	if (t->out_vrf_id < MAX_VRFS)
 		return snprintf(
 			buf,
@@ -250,6 +252,7 @@ srv6_local_process(struct rte_graph *graph, struct rte_node *node, void **objs, 
 	struct srv6_localsid_data *sr_d;
 	struct ip6_local_mbuf_data *d;
 	struct trace_srv6_data *t;
+	const struct nexthop *nh;
 	struct rte_ipv6_hdr *ip6;
 	struct rte_mbuf *m;
 	rte_edge_t edge;
@@ -258,6 +261,9 @@ srv6_local_process(struct rte_graph *graph, struct rte_node *node, void **objs, 
 	for (uint16_t i = 0; i < nb_objs; i++) {
 		m = objs[i];
 		ip6 = rte_pktmbuf_mtod(m, struct rte_ipv6_hdr *);
+
+		nh = ip6_output_mbuf_data(m)->nh;
+		sr_d = (struct srv6_localsid_data *) &nh->priv;
 
 		ret = ip6_fill_local_data(ip6, edges, m);
 		if (ret < 0) {
@@ -269,15 +275,7 @@ srv6_local_process(struct rte_graph *graph, struct rte_node *node, void **objs, 
 		if (edge == UNEXPECTED_UPPER)
 			goto next;
 		assert(edge == EDGE_COUNT);
-		d = ip6_local_mbuf_data(m);
 
-		// retrieve lsid data. should always succeed as long as
-		// localdata is in sync with fib.
-		sr_d = srv6_localsid_get(&d->dst, d->iface->vrf_id);
-		if (sr_d == NULL) {
-			edge = INVALID_PACKET;
-			goto next;
-		}
 
 		if (gr_mbuf_is_traced(m)) {
 			t = gr_mbuf_trace_add(m, node, sizeof(*t));
@@ -287,6 +285,7 @@ srv6_local_process(struct rte_graph *graph, struct rte_node *node, void **objs, 
 			t = NULL;
 		}
 
+		d = ip6_local_mbuf_data(m);
 		if (d->proto == IPPROTO_ROUTING) {
 			size_t ext_len;
 

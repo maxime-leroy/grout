@@ -4,18 +4,19 @@
 #ifndef _GR_SRV6_PRIV
 #define _GR_SRV6_PRIV
 
+#include "gr_nh_control.h"
+
 #include "gr_srv6.h"
 
 //
-// srv6 data shared between control - sr6_localsid node
+// srv6 data stored in nexthop priv
 //
-struct srv6_localsid_data {
+GR_PRIV_STRUCT(
+	srv6_localsid_data,
 	gr_srv6_behavior_t behavior;
 	uint16_t out_vrf_id;
 	uint8_t flags;
-};
-
-struct srv6_localsid_data *srv6_localsid_get(const struct rte_ipv6_addr *lsid, uint16_t vrf_id);
+);
 
 //
 // srv6 data shared between control - sr6_headend node
