@@ -15,14 +15,21 @@
 //
 
 enum {
-	IP_INPUT = 0,
+	UNEXPECTED_UPPER = 0, // must be zero for ip6_fill_local_data(ip, edges, d):
+	IP_INPUT,
 	IP6_INPUT,
 	IP6_LOCAL,
 	INVALID_PACKET,
-	UNEXPECTED_UPPER,
 	NO_TRANSIT,
 	DEST_UNREACH,
 	EDGE_COUNT,
+};
+
+static rte_edge_t edges[256] = {
+	//[0 ... 255] = UNEXPECTED_UPPER,
+	[IPPROTO_IPIP] =  EDGE_COUNT,
+	[IPPROTO_IPV6] =  EDGE_COUNT,
+	[IPPROTO_ROUTING] = EDGE_COUNT,
 };
 
 static const char *behavior_str[SR_BEHAVIOR_MAX] = {
@@ -219,6 +226,7 @@ static inline rte_edge_t srv6_local_process_pkt(
 	struct rte_ipv6_routing_ext *sr,
 	struct rte_ipv6_hdr *ip6
 ) {
+
 	switch (sr_d->behavior) {
 	case SR_BEHAVIOR_END:
 	case SR_BEHAVIOR_END_T:
@@ -234,13 +242,10 @@ static inline rte_edge_t srv6_local_process_pkt(
 	}
 }
 
-// called from 'ip6_input_local' node. ipv6 hdr and exthdr are still in mbuf
-static uint16_t srv6_local_srh_process(
-	struct rte_graph *graph,
-	struct rte_node *node,
-	void **objs,
-	uint16_t nb_objs
-) {
+// called from 'ip6_input' node
+static uint16_t
+srv6_local_process(struct rte_graph *graph, struct rte_node *node, void **objs, uint16_t nb_objs)
+{
 	struct rte_ipv6_routing_ext *sr = NULL;
 	struct srv6_localsid_data *sr_d;
 	struct ip6_local_mbuf_data *d;
@@ -248,11 +253,22 @@ static uint16_t srv6_local_srh_process(
 	struct rte_ipv6_hdr *ip6;
 	struct rte_mbuf *m;
 	rte_edge_t edge;
-	size_t ext_len = 0;
+	int ret;
 
 	for (uint16_t i = 0; i < nb_objs; i++) {
 		m = objs[i];
+		ip6 = rte_pktmbuf_mtod(m, struct rte_ipv6_hdr *);
 
+		ret = ip6_fill_local_data(ip6, edges, m);
+		if (ret < 0) {
+			edge = INVALID_PACKET ;
+			goto next;
+		}
+		edge = ret;
+
+		if (edge == UNEXPECTED_UPPER)
+			goto next;
+		assert(edge == EDGE_COUNT);
 		d = ip6_local_mbuf_data(m);
 
 		// retrieve lsid data. should always succeed as long as
@@ -271,20 +287,24 @@ static uint16_t srv6_local_srh_process(
 			t = NULL;
 		}
 
-		// check SRH correctness
-		ip6 = rte_pktmbuf_mtod(m, struct rte_ipv6_hdr *);
-		sr = rte_pktmbuf_mtod_offset(m, struct rte_ipv6_routing_ext *, d->ext_offset);
-		rte_ipv6_get_next_ext((const uint8_t *)sr, d->proto, &ext_len);
-		if ((size_t)((sr->hdr_len + 1) << 3) != ext_len || sr->last_entry > ext_len / 2 - 1
-		    || sr->segments_left > sr->last_entry + 1
-		    || sr->type != RTE_IPV6_SRCRT_TYPE_4) {
-			// XXX send icmp parameter problem
-			edge = INVALID_PACKET;
-			goto next;
-		}
+		if (d->proto == IPPROTO_ROUTING) {
+			size_t ext_len;
 
-		if (t != NULL)
-			t->segleft = sr->segments_left;
+			sr = rte_pktmbuf_mtod_offset(m, struct rte_ipv6_routing_ext *,
+						     d->ext_offset);
+			rte_ipv6_get_next_ext((const uint8_t *)sr, d->proto, &ext_len);
+			if ((size_t)((sr->hdr_len + 1) << 3) != ext_len ||
+			    sr->last_entry > ext_len / 2 - 1
+			    || sr->segments_left > sr->last_entry + 1
+			    || sr->type != RTE_IPV6_SRCRT_TYPE_4) {
+				// XXX send icmp parameter problem
+				edge = INVALID_PACKET;
+				goto next;
+			}
+
+			if (t != NULL)
+				t->segleft = sr->segments_left;
+		}
 
 		edge = srv6_local_process_pkt(m, sr_d, sr, ip6);
 
@@ -295,69 +315,14 @@ next:
 	return nb_objs;
 }
 
-// called from 'ip6_input_local' node. ipv6 hdr and exthdr are stripped from mbuf
-static uint16_t
-srv6_local_process(struct rte_graph *graph, struct rte_node *node, void **objs, uint16_t nb_objs) {
-	struct srv6_localsid_data *sr_d;
-	struct ip6_local_mbuf_data *d;
-	struct rte_mbuf *m;
-	rte_edge_t edge;
-
-	for (uint16_t i = 0; i < nb_objs; i++) {
-		m = objs[i];
-
-		d = ip6_local_mbuf_data(m);
-		sr_d = srv6_localsid_get(&d->dst, d->iface->vrf_id);
-		if (sr_d == NULL) {
-			edge = INVALID_PACKET;
-			goto next;
-		}
-
-		if (gr_mbuf_is_traced(m)) {
-			struct trace_srv6_data *t = gr_mbuf_trace_add(m, node, sizeof(*t));
-			t->behavior = sr_d->behavior;
-			t->out_vrf_id = sr_d->out_vrf_id;
-		}
-
-		edge = srv6_local_process_pkt(m, sr_d, NULL, NULL);
-
-next:
-		rte_node_enqueue_x1(graph, node, edge, m);
-	}
-
-	return nb_objs;
-}
-
 static void srv6_node_init(void) {
-	ip6_input_local_add_proto(IPPROTO_IPIP, "sr6_local");
-	ip6_input_local_add_proto(IPPROTO_IPV6, "sr6_local");
-}
-
-static void srv6_node_srh_init(void) {
-	ip6_input_local_add_proto(IPPROTO_ROUTING, "sr6_local_srh");
-}
+	ip6_input_register_nexthop_type(GR_NH_SR6_LOCAL, "sr6_local");
+};
 
 static struct rte_node_register srv6_local_node = {
 	.name = "sr6_local",
 
 	.process = srv6_local_process,
-
-	.nb_edges = EDGE_COUNT,
-	.next_nodes = {
-		[IP_INPUT] = "ip_input",
-		[IP6_INPUT] = "ip6_input",
-		[IP6_LOCAL] = "ip6_input_local",
-		[INVALID_PACKET] = "sr6_local_invalid",
-		[UNEXPECTED_UPPER] = "sr6_local_unexpected_upper",
-		[NO_TRANSIT] = "sr6_local_no_transit",
-		[DEST_UNREACH] = "ip6_error_dest_unreach",
-	},
-};
-
-static struct rte_node_register srv6_local_node_srh = {
-	.name = "sr6_local_srh",
-
-	.process = srv6_local_srh_process,
 
 	.nb_edges = EDGE_COUNT,
 	.next_nodes = {
@@ -377,14 +342,8 @@ static struct gr_node_info srv6_local_info = {
 	.register_callback = srv6_node_init,
 };
 
-static struct gr_node_info srv6_local_srh_info = {
-	.node = &srv6_local_node_srh,
-	.trace_format = trace_srv6_format,
-	.register_callback = srv6_node_srh_init,
-};
 
 GR_NODE_REGISTER(srv6_local_info);
-GR_NODE_REGISTER(srv6_local_srh_info);
 
 GR_DROP_REGISTER(sr6_local_invalid);
 GR_DROP_REGISTER(sr6_local_unexpected_upper);
