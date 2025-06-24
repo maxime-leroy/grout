@@ -239,16 +239,22 @@ static struct api_out route6_add(const void *request, void ** /*response*/) {
 	if (req->origin == GR_RT_ORIGIN_INTERNAL)
 		return api_out(EINVAL, 0);
 
-	// ensure route gateway is reachable
-	if ((nh = rib6_lookup(req->vrf_id, GR_IFACE_ID_UNDEF, &req->nh)) == NULL)
-		return api_out(EHOSTUNREACH, 0);
+	if (req->nh_id != GR_NH_ID_UNSET) {
+		nh = nexthop_lookup_by_id(req->nh_id);
+		if (nh == NULL)
+			return api_out(ENOENT, 0);
+	} else {
+		// ensure route gateway is reachable
+		if ((nh = rib6_lookup(req->vrf_id, GR_IFACE_ID_UNDEF, &req->nh)) == NULL)
+			return api_out(EHOSTUNREACH, 0);
 
-	// if the route gateway is reachable via a prefix route,
-	// create a new unresolved nexthop
-	if (!rte_ipv6_addr_eq(&nh->ipv6, &req->nh)) {
-		if ((nh = nh6_new(req->vrf_id, nh->iface_id, &req->nh)) == NULL)
-			return api_out(errno, 0);
-		nh->flags |= GR_NH_F_GATEWAY;
+		// if the route gateway is reachable via a prefix route,
+		// create a new unresolved nexthop
+		if (!rte_ipv6_addr_eq(&nh->ipv6, &req->nh)) {
+			if ((nh = nh6_new(req->vrf_id, nh->iface_id, &req->nh)) == NULL)
+				return api_out(errno, 0);
+			nh->flags |= GR_NH_F_GATEWAY;
+		}
 	}
 
 	// if route insert fails, the created nexthop will be freed
