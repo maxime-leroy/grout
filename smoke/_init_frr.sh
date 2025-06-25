@@ -86,6 +86,8 @@ set_ip_route() {
 	exit
 EOF
 
+	sleep 1
+	grcli show ${gr_ip} route
 	while ! grcli show ${gr_ip} route | grep -q "${grep_pattern}"; do
 		if [ "$count" -ge "$max_tries" ]; then
 			echo "Route ${prefix} via ${next_hop} not found after ${max_tries} attempts."
