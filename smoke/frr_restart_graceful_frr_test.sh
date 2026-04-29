@@ -31,23 +31,54 @@
 
 prefix_orphan=10.99.99.0/24
 prefix_kept=10.88.88.0/24
+sr6_orphan=192.168.99.0/24
+sr6_kept=192.168.88.0/24
+sr6_orphan_sid=fd00:202:100::
+sr6_kept_sid=fd00:202:200::
+sr6_localsid_orphan=fd00:202:300::
+sr6_localsid_kept=fd00:202:400::
 nh_ip=172.16.0.2
+nh6_ip=fd00:102::2
+
+# A second VRF is required so the two SR6_LOCAL SIDs land in distinct
+# (behavior, vrf) contexts in zebra's SRv6 manager. With a single VRF
+# the second sid request would release the first one rather than
+# coexist.
+create_vrf vrf2
 
 create_interface p0
 set_ip_address p0 172.16.0.1/24
+set_ip_address p0 fd00:102::1/64
 
 netns_add n0
 move_to_netns x-p0 n0
 ip -n n0 addr add ${nh_ip}/24 dev x-p0
+ip -n n0 addr add ${nh6_ip}/64 dev x-p0
 
+# Runtime install (vtysh) + persistence (frr.conf) for the kept set.
+# The *_orphan entries stay vty-only: their install vanishes from
+# staticd memory after SIGKILL, the plugin's SELFROUTE placeholders
+# end up unreclaimed and swept. The *_kept entries are also written
+# to frr.conf so staticd rehydrates them via mgmtd at restart and
+# rib_compare_routes transfers ownership of the SELFROUTE entries to
+# ZEBRA_ROUTE_STATIC.
 set_ip_route $prefix_orphan $nh_ip
 set_ip_route $prefix_kept $nh_ip
-
-# Persist $prefix_kept to frr.conf so staticd rehydrates it at restart.
-# $prefix_orphan is deliberately left out: its vty-only install vanishes
-# from staticd's memory after SIGKILL and the plugin's SELFROUTE
-# placeholder ends up unreclaimed.
 set_ip_route --persist $prefix_kept $nh_ip
+
+# Reachability for the SID block + SR6_OUTPUT prefixes.
+set_ip_route fd00:202::/32 $nh6_ip
+set_ip_route --persist fd00:202::/32 $nh6_ip
+set_srv6_route $sr6_orphan p0 $sr6_orphan_sid
+set_srv6_route $sr6_kept p0 $sr6_kept_sid
+set_srv6_route --persist $sr6_kept p0 $sr6_kept_sid
+
+# SR6_LOCAL static-SIDs. Two SIDs need two distinct (behavior, vrf)
+# contexts: the orphan decaps into the default VRF, the kept one
+# into vrf2. Only the kept SID is persisted to frr.conf.
+set_srv6_localsid loc1 fd00:202 $sr6_localsid_orphan
+set_srv6_localsid loc1 fd00:202 $sr6_localsid_kept end.dt4 vrf2
+set_srv6_localsid --persist loc1 fd00:202 $sr6_localsid_kept end.dt4 vrf2
 
 grcli -j route show | jq -e \
 	".[] | select(.destination == \"$prefix_orphan\")" >/dev/null \
@@ -55,6 +86,18 @@ grcli -j route show | jq -e \
 grcli -j route show | jq -e \
 	".[] | select(.destination == \"$prefix_kept\")" >/dev/null \
 	|| fail "prefix $prefix_kept not installed in grout FIB"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_orphan\")" >/dev/null \
+	|| fail "prefix $sr6_orphan not installed in grout FIB"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_kept\")" >/dev/null \
+	|| fail "prefix $sr6_kept not installed in grout FIB"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_localsid_orphan/48\")" >/dev/null \
+	|| fail "static-SID $sr6_localsid_orphan/48 not installed in grout FIB"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_localsid_kept/48\")" >/dev/null \
+	|| fail "static-SID $sr6_localsid_kept/48 not installed in grout FIB"
 
 # Simulate crash: SIGKILL zebra + staticd. No dplane fini runs, both
 # routes stay in grout's FIB as orphans.
@@ -73,6 +116,18 @@ grcli -j route show | jq -e \
 grcli -j route show | jq -e \
 	".[] | select(.destination == \"$prefix_kept\")" >/dev/null \
 	|| fail "$prefix_kept unexpectedly gone from grout FIB after SIGKILL"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_orphan\")" >/dev/null \
+	|| fail "$sr6_orphan unexpectedly gone from grout FIB after SIGKILL"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_kept\")" >/dev/null \
+	|| fail "$sr6_kept unexpectedly gone from grout FIB after SIGKILL"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_localsid_orphan/48\")" >/dev/null \
+	|| fail "$sr6_localsid_orphan/48 unexpectedly gone from grout FIB after SIGKILL"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_localsid_kept/48\")" >/dev/null \
+	|| fail "$sr6_localsid_kept/48 unexpectedly gone from grout FIB after SIGKILL"
 
 mark_events
 
@@ -85,16 +140,30 @@ echo "zebra nexthop-group keep 1" >> "$builddir/frr_install/etc/frr/frr.conf"
 
 frrinit.sh restart
 
-# Orphan gets swept, reclaimed route must NOT emit a grout del event.
+# Orphans get swept, reclaimed routes must NOT emit a grout del event.
 wait_event -t 15 "route4 del: vrf=main $prefix_orphan"
+wait_event -t 15 "route4 del: vrf=main $sr6_orphan"
+wait_event -t 15 "route6 del: vrf=main $sr6_localsid_orphan/48"
 
 grcli -j route show | jq -e \
 	".[] | select(.destination == \"$prefix_orphan\")" >/dev/null \
 	&& fail "$prefix_orphan still in grout FIB after sweep"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_orphan\")" >/dev/null \
+	&& fail "$sr6_orphan still in grout FIB after sweep"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_localsid_orphan/48\")" >/dev/null \
+	&& fail "$sr6_localsid_orphan/48 still in grout FIB after sweep"
 
 grcli -j route show | jq -e \
 	".[] | select(.destination == \"$prefix_kept\")" >/dev/null \
 	|| fail "$prefix_kept unexpectedly gone from grout FIB after sweep (reclaim broken)"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_kept\")" >/dev/null \
+	|| fail "$sr6_kept unexpectedly gone from grout FIB after sweep (SR6 reclaim broken)"
+grcli -j route show | jq -e \
+	".[] | select(.destination == \"$sr6_localsid_kept/48\")" >/dev/null \
+	|| fail "$sr6_localsid_kept/48 unexpectedly gone from grout FIB after sweep (SR6_LOCAL reclaim broken)"
 
 # In zebra's RIB the reclaimed prefix must be ZEBRA_ROUTE_STATIC, not
 # kernel/self: rib_compare_routes transferred ownership from the
@@ -102,6 +171,13 @@ grcli -j route show | jq -e \
 vtysh -c "show ip route $prefix_kept" 2>/dev/null \
 	| grep -qE 'Known via "static"' \
 	|| fail "$prefix_kept is not a static route in zebra RIB after reclaim"
+vtysh -c "show ip route $sr6_kept" 2>/dev/null \
+	| grep -qE 'Known via "static"' \
+	|| fail "$sr6_kept is not a static route in zebra RIB after reclaim"
+vtysh -c "show ip route $sr6_kept json" 2>/dev/null \
+	| jq -e ".\"$sr6_kept\"[].nexthops[] | select(.seg6.segs == \"$sr6_kept_sid\")" \
+	>/dev/null \
+	|| fail "$sr6_kept lost its seg6 SID after reclaim"
 
 # Marker lifecycle assertions (same as sweep-only test).
 grep -q "sync marker observed" "$flog" \
