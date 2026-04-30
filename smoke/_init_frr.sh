@@ -179,9 +179,12 @@ set_srv6_route() {
 	    route="route4"
     fi
 
-    # ----- build CLI & Grout forms ----------------------------------------
-    local seg_frr   ; IFS=/ ; seg_frr="${sids[*]}"       # SID/SID/…
-    local seg_space ; IFS=' ' ; seg_space="${sids[*]}"   # SID SID …
+    # ----- build CLI form -------------------------------------------------
+    # Run the join in a subshell so the IFS change does not leak to the
+    # rest of the function (where wait_event/mark_events read $tmp paths
+    # that would split on /).
+    local seg_frr
+    seg_frr=$(IFS=/; echo "${sids[*]}")   # SID/SID/...
 
     mark_events
 
