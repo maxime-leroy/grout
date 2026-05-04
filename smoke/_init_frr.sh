@@ -180,7 +180,14 @@ exit"
 #
 set_srv6_route() {
 	local persist=0
-	[ "$1" = "--persist" ] && { persist=1; shift; }
+	local vrf_name="default"
+	while [[ "$1" == --* ]]; do
+		case "$1" in
+			--persist) persist=1; shift ;;
+			--vrf)     vrf_name="$2"; shift 2 ;;
+			*) echo "set_srv6_route: unknown option $1" >&2; return 1 ;;
+		esac
+	done
 	local prefix="$1"
 	local nhop="$2"
 	shift 2                       # all remaining words are SIDs
@@ -210,9 +217,28 @@ set_srv6_route() {
 	local seg_frr
 	seg_frr=$(IFS=/; echo "${sids[*]}")   # SID/SID/...
 
+	# grout names the default VRF "main"; rest match by name.
+	local gr_vrf_name="${vrf_name}"
+	[ "$gr_vrf_name" = "default" ] && gr_vrf_name="main"
+
+	# L3VPN shape when vrf != default: route lives in <vrf_name>, encap
+	# nexthop sits in default (interface ${nhop}). The `nexthop-vrf
+	# default` clause is mandatory: without it, staticd refuses with
+	# "interface does not exist in specified vrf" because p0 is in
+	# default. vty/conf block form `vrf X / route / exit-vrf` binds
+	# the route to the customer VRF.
+	local cfg
+	if [ "$vrf_name" = "default" ]; then
+		cfg="${frr_ip} route ${prefix} ${nhop} segments ${seg_frr}"
+	else
+		cfg="vrf ${vrf_name}
+ ${frr_ip} route ${prefix} ${nhop} segments ${seg_frr} nexthop-vrf default
+exit-vrf"
+	fi
+
 	_apply_frr_config "$persist" \
-		"$route add: vrf=.+ $prefix origin=zebra_static via type=SRv6 .*${sids[0]}" \
-		"${frr_ip} route ${prefix} ${nhop} segments ${seg_frr}"
+		"$route add: vrf=$gr_vrf_name $prefix origin=zebra_static via type=SRv6 .*${sids[0]}" \
+		"$cfg"
 }
 
 #   <namespace> : optional netns name ("" = root namespace)

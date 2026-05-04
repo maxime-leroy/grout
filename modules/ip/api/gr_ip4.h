@@ -39,6 +39,7 @@ enum gr_ip4_requests : uint32_t {
 	GR_IP4_ICMP_RECV,
 	GR_IP4_FIB_DEFAULT_SET,
 	GR_IP4_FIB_INFO_LIST,
+	GR_IP4_ROUTE_STATS_LIST,
 };
 
 // routes //////////////////////////////////////////////////////////////////////
@@ -172,6 +173,32 @@ struct gr_ip4_fib_info_list_req {
 };
 
 GR_REQ_STREAM(GR_IP4_FIB_INFO_LIST, struct gr_ip4_fib_info_list_req, struct gr_fib4_info);
+
+// Cumulative IPv4 route ADD/DEL counters per (vrf, origin).
+//
+// del_no_route and del_no_vrf are per-VRF totals (no origin breakdown
+// because the route did not exist when the delete request arrived).
+// They are denormalized: emitted with the same value on every row of
+// a given VRF, and on a synthetic origin=GR_NH_ORIGIN_INTERNAL row
+// when no per-origin activity has been recorded for that VRF.
+struct gr_ip4_route_stats {
+	uint16_t vrf_id;
+	gr_nh_origin_t origin;
+	uint64_t added;
+	uint64_t deleted;
+	uint64_t del_no_route;
+	uint64_t del_no_vrf;
+};
+
+struct gr_ip4_route_stats_list_req {
+	uint16_t vrf_id; // GR_VRF_ID_UNDEF for all
+};
+
+GR_REQ_STREAM(
+	GR_IP4_ROUTE_STATS_LIST,
+	struct gr_ip4_route_stats_list_req,
+	struct gr_ip4_route_stats
+);
 
 // events //////////////////////////////////////////////////////////////////////
 

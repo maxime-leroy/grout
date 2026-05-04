@@ -42,6 +42,7 @@ enum gr_ip6_requests : uint32_t {
 	GR_IP6_IFACE_RA_SHOW,
 	GR_IP6_ICMP6_SEND,
 	GR_IP6_ICMP6_RECV,
+	GR_IP6_ROUTE_STATS_LIST,
 };
 
 // routes //////////////////////////////////////////////////////////////////////
@@ -144,6 +145,30 @@ struct gr_ip6_fib_info_list_req {
 };
 
 GR_REQ_STREAM(GR_IP6_FIB_INFO_LIST, struct gr_ip6_fib_info_list_req, struct gr_fib6_info);
+
+// Cumulative IPv6 route ADD/DEL counters per (vrf, origin).
+//
+// del_no_route and del_no_vrf are per-VRF totals (no origin breakdown
+// because the route did not exist when the delete request arrived).
+// Denormalized like the IPv4 variant.
+struct gr_ip6_route_stats {
+	uint16_t vrf_id;
+	gr_nh_origin_t origin;
+	uint64_t added;
+	uint64_t deleted;
+	uint64_t del_no_route;
+	uint64_t del_no_vrf;
+};
+
+struct gr_ip6_route_stats_list_req {
+	uint16_t vrf_id; // GR_VRF_ID_UNDEF for all
+};
+
+GR_REQ_STREAM(
+	GR_IP6_ROUTE_STATS_LIST,
+	struct gr_ip6_route_stats_list_req,
+	struct gr_ip6_route_stats
+);
 
 // router advertisement ////////////////////////////////////////////////////////
 

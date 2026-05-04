@@ -28,6 +28,13 @@ LOG_TYPE("route");
 
 static uint32_t route_counts[GR_MAX_IFACES][UINT_NUM_VALUES(gr_nh_origin_t)];
 static uint64_t route_prefixlens[GR_MAX_IFACES][RTE_FIB_MAXDEPTH + 1];
+static uint64_t route_added[GR_MAX_IFACES][UINT_NUM_VALUES(gr_nh_origin_t)];
+static uint64_t route_deleted[GR_MAX_IFACES][UINT_NUM_VALUES(gr_nh_origin_t)];
+static uint64_t route_del_no_route[GR_MAX_IFACES];
+// Global (not per-VRF): incremented when a delete request targets a vrf
+// id that has no IPv4 FIB. By definition the vrf doesn't exist at that
+// moment, so per-vrf indexing is meaningless.
+static uint64_t route_del_no_vrf;
 
 static uint32_t max_routes_default = 1 << 16;
 
@@ -239,10 +246,12 @@ static int rib4_insert_or_replace(
 		route_counts[vrf_id][*o]--;
 		assert(route_prefixlens[vrf_id][prefixlen] > 0);
 		route_prefixlens[vrf_id][prefixlen]--;
+		route_deleted[vrf_id][*o]++;
 	}
 	*o = origin;
 	route_counts[vrf_id][origin]++;
 	route_prefixlens[vrf_id][prefixlen]++;
+	route_added[vrf_id][origin]++;
 
 	if (origin != GR_NH_ORIGIN_INTERNAL) {
 		event_push(
@@ -317,6 +326,7 @@ int rib4_delete(uint16_t vrf_id, ip4_addr_t ip, uint8_t prefixlen, gr_nh_type_t 
 	route_counts[vrf_id][origin]--;
 	assert(route_prefixlens[vrf_id][prefixlen] > 0);
 	route_prefixlens[vrf_id][prefixlen]--;
+	route_deleted[vrf_id][origin]++;
 
 	nexthop_decref(nh);
 
@@ -384,6 +394,12 @@ static struct api_out route4_del(const void *request, struct api_ctx *) {
 	ret = rib4_delete(
 		req->vrf_id, req->dest.ip, req->dest.prefixlen, nh ? nh->type : GR_NH_T_L3
 	);
+	if (ret == -ENOENT) {
+		if (req->vrf_id < GR_MAX_IFACES)
+			route_del_no_route[req->vrf_id]++;
+	} else if (ret == -ENONET) {
+		route_del_no_vrf++;
+	}
 	if ((ret == -ENOENT || ret == -ENONET) && req->missing_ok)
 		ret = 0;
 
@@ -568,6 +584,26 @@ void rib4_cleanup(struct nexthop *nh) {
 }
 
 METRIC_GAUGE(m_routes, "rib4_routes", "Number of IPv4 routes by origin.");
+METRIC_COUNTER(
+	m_routes_added,
+	"rib4_routes_added",
+	"Cumulative IPv4 routes added by origin and vrf."
+);
+METRIC_COUNTER(
+	m_routes_deleted,
+	"rib4_routes_deleted",
+	"Cumulative IPv4 routes deleted by origin and vrf."
+);
+METRIC_COUNTER(
+	m_routes_del_no_route,
+	"rib4_routes_del_no_route",
+	"Cumulative IPv4 route deletes that targeted a non-existent prefix per vrf."
+);
+METRIC_COUNTER(
+	m_routes_del_no_vrf,
+	"rib4_routes_del_no_vrf",
+	"Cumulative IPv4 route deletes that targeted a vrf id with no FIB (global)."
+);
 METRIC_GAUGE(m_max_routes, "rib4_max_routes", "Maximum number of IPv4 routes.");
 #ifdef HAVE_RTE_FIB_TBL8_GET_STATS
 METRIC_GAUGE(m_max_tbl8, "fib4_max_tbl8", "Maximum number of IPv4 FIB tbl8 groups.");
@@ -600,9 +636,12 @@ static void rib4_metrics_collect(struct metrics_writer *w) {
 				continue;
 			metrics_ctx_init(&ctx, w, "vrf", vrf, "origin", gr_nh_origin_name(o), NULL);
 			metric_emit(&ctx, &m_routes, route_counts[vrf_id][o]);
+			metric_emit(&ctx, &m_routes_added, route_added[vrf_id][o]);
+			metric_emit(&ctx, &m_routes_deleted, route_deleted[vrf_id][o]);
 		}
 
 		metrics_ctx_init(&ctx, w, "vrf", vrf, NULL);
+		metric_emit(&ctx, &m_routes_del_no_route, route_del_no_route[vrf_id]);
 		metric_emit(&ctx, &m_max_routes, fib4_get_max_routes(vrf_iface));
 #ifdef HAVE_RTE_FIB_TBL8_GET_STATS
 		uint32_t used_tbl8, total_tbl8;
@@ -622,6 +661,9 @@ static void rib4_metrics_collect(struct metrics_writer *w) {
 			ARRAY_DIM(buckets)
 		);
 	}
+
+	metrics_ctx_init(&ctx, w, NULL);
+	metric_emit(&ctx, &m_routes_del_no_vrf, route_del_no_vrf);
 }
 
 static struct metrics_collector rib4_collector = {
@@ -795,6 +837,58 @@ static struct api_out fib4_info_list(const void *request, struct api_ctx *ctx) {
 	return api_out(0, 0, NULL);
 }
 
+static struct api_out route4_stats_list(const void *request, struct api_ctx *ctx) {
+	const struct gr_ip4_route_stats_list_req *req = request;
+	struct gr_ip4_route_stats stats;
+
+	for (uint16_t v = 0; v < GR_MAX_IFACES; v++) {
+		if (v != req->vrf_id && req->vrf_id != GR_VRF_ID_UNDEF)
+			continue;
+		if (get_vrf_iface(v) == NULL)
+			continue;
+		bool emitted = false;
+		for (unsigned o = 0; o < UINT_NUM_VALUES(gr_nh_origin_t); o++) {
+			if (!nexthop_origin_valid(o))
+				continue;
+			if (route_added[v][o] == 0 && route_deleted[v][o] == 0)
+				continue;
+			stats.vrf_id = v;
+			stats.origin = o;
+			stats.added = route_added[v][o];
+			stats.deleted = route_deleted[v][o];
+			stats.del_no_route = route_del_no_route[v];
+			stats.del_no_vrf = 0;
+			api_send(ctx, sizeof(stats), &stats);
+			emitted = true;
+		}
+		// Surface del_no_route for VRFs with no per-origin activity
+		// (a stream of failed deletes only).
+		if (!emitted && route_del_no_route[v] != 0) {
+			stats.vrf_id = v;
+			stats.origin = GR_NH_ORIGIN_INTERNAL;
+			stats.added = 0;
+			stats.deleted = 0;
+			stats.del_no_route = route_del_no_route[v];
+			stats.del_no_vrf = 0;
+			api_send(ctx, sizeof(stats), &stats);
+		}
+	}
+
+	// Emit one synthetic global row carrying the per-AF del_no_vrf
+	// count. Only when no specific vrf is requested.
+	if (req->vrf_id == GR_VRF_ID_UNDEF && route_del_no_vrf != 0) {
+		stats.vrf_id = GR_VRF_ID_UNDEF;
+		stats.origin = GR_NH_ORIGIN_INTERNAL;
+		stats.added = 0;
+		stats.deleted = 0;
+		stats.del_no_route = 0;
+		stats.del_no_vrf = route_del_no_vrf;
+		api_send(ctx, sizeof(stats), &stats);
+	}
+
+	return api_out(0, 0, NULL);
+}
+
 static struct module route4_module = {
 	.name = "ip_route",
 	.depends_on = "nexthop",
@@ -826,6 +920,14 @@ static void fib4_fini(struct iface *vrf) {
 	}
 	memset(route_counts[vrf->id], 0, sizeof(route_counts[vrf->id]));
 	memset(route_prefixlens[vrf->id], 0, sizeof(route_prefixlens[vrf->id]));
+	memset(route_added[vrf->id], 0, sizeof(route_added[vrf->id]));
+	memset(route_deleted[vrf->id], 0, sizeof(route_deleted[vrf->id]));
+	// del_no_route tracks "vrf exists, route doesn't" — only meaningful
+	// during a VRF's lifetime, so reset on fini.
+	route_del_no_route[vrf->id] = 0;
+	// del_no_vrf tracks delete attempts against a non-existent vrf id,
+	// which by definition cannot accumulate while this fini runs.
+	// Leave it untouched so prior counts survive a recreate.
 }
 
 static struct api_out fib4_default_set(const void *request, struct api_ctx *) {
@@ -855,6 +957,7 @@ RTE_INIT(control_ip_init) {
 	api_handler(GR_IP4_ROUTE_LIST, route4_list);
 	api_handler(GR_IP4_FIB_DEFAULT_SET, fib4_default_set);
 	api_handler(GR_IP4_FIB_INFO_LIST, fib4_info_list);
+	api_handler(GR_IP4_ROUTE_STATS_LIST, route4_stats_list);
 	event_serializer(GR_EVENT_IP_ROUTE_ADD, serialize_route4_event);
 	event_serializer(GR_EVENT_IP_ROUTE_DEL, serialize_route4_event);
 	module_register(&route4_module);

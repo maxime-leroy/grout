@@ -323,10 +323,16 @@ static void grout_route_change(
 	uint16_t family,
 	void *dest_addr,
 	uint8_t dest_prefixlen,
+	uint16_t gr_route_vrf_id,
 	struct gr_nexthop *gr_nh,
 	bool startup
 ) {
-	uint32_t vrf_id = vrf_grout_to_frr(gr_nh->vrf_id);
+	// Route's own vrf, not the nexthop's. They diverge for any cross-vrf
+	// nexthop pattern (SRv6 tunnels, VRF leaking, route-target imports):
+	// the route lives in the L3VPN vrf while the nexthop sits in an
+	// underlay/transit vrf. Using gr_nh->vrf_id here would inject the
+	// route into the wrong vrf in zebra and break sweep/cleanup.
+	uint32_t vrf_id = vrf_grout_to_frr(gr_route_vrf_id);
 	bool selfroute = is_selfroute(origin);
 	int proto = ZEBRA_ROUTE_KERNEL;
 	uint32_t nh_id = gr_nh->nh_id;
@@ -399,6 +405,7 @@ static void grout_route_change(
 	if (new) {
 		struct route_entry *re;
 		struct nexthop_group *ng = NULL;
+		int rib_ret;
 
 		re = zebra_rib_route_entry_new(vrf_id, proto, 0, flags, nh_id, tableid, 0, 0, 0, 0);
 		if (nh) {
@@ -408,10 +415,16 @@ static void grout_route_change(
 		}
 
 #if CURRENT_FRR_VERSION >= MAKE_FRRVERSION(10, 6, 0)
-		rib_add_multipath(afi, SAFI_UNICAST, &p, NULL, re, ng, false, false);
+		rib_ret = rib_add_multipath(afi, SAFI_UNICAST, &p, NULL, re, ng, false, false);
 #else
-		rib_add_multipath(afi, SAFI_UNICAST, &p, NULL, re, ng, false);
+		rib_ret = rib_add_multipath(afi, SAFI_UNICAST, &p, NULL, re, ng, false);
 #endif
+
+		if (startup && selfroute) {
+			grout_stats_selfroute_inject(family);
+			if (rib_ret < 0)
+				grout_stats_selfroute_inject_failed(family);
+		}
 
 		if (ng)
 			nexthop_group_delete(&ng);
@@ -439,12 +452,13 @@ static void grout_route_change(
 
 void grout_route4_change(bool new, struct gr_ip4_route *gr_r4, bool startup) {
 	gr_log_debug(
-		"%s %pI4/%u origin %s nh_id %u vrf %u",
+		"%s %pI4/%u origin %s nh_id %u route_vrf %u nh_vrf %u",
 		new ? "add" : "del",
 		&gr_r4->dest.ip,
 		gr_r4->dest.prefixlen,
 		gr_nh_origin_name(gr_r4->origin),
 		gr_r4->nh.nh_id,
+		gr_r4->vrf_id,
 		gr_r4->nh.vrf_id
 	);
 	grout_route_change(
@@ -453,6 +467,7 @@ void grout_route4_change(bool new, struct gr_ip4_route *gr_r4, bool startup) {
 		AF_INET,
 		(void *)&gr_r4->dest.ip,
 		gr_r4->dest.prefixlen,
+		gr_r4->vrf_id,
 		&gr_r4->nh,
 		startup
 	);
@@ -460,12 +475,13 @@ void grout_route4_change(bool new, struct gr_ip4_route *gr_r4, bool startup) {
 
 void grout_route6_change(bool new, struct gr_ip6_route *gr_r6, bool startup) {
 	gr_log_debug(
-		"%s %pI6/%u origin %s nh_id %u vrf %u",
+		"%s %pI6/%u origin %s nh_id %u route_vrf %u nh_vrf %u",
 		new ? "add" : "del",
 		&gr_r6->dest.ip,
 		gr_r6->dest.prefixlen,
 		gr_nh_origin_name(gr_r6->origin),
 		gr_r6->nh.nh_id,
+		gr_r6->vrf_id,
 		gr_r6->nh.vrf_id
 	);
 	grout_route_change(
@@ -474,12 +490,19 @@ void grout_route6_change(bool new, struct gr_ip6_route *gr_r6, bool startup) {
 		AF_INET6,
 		(void *)&gr_r6->dest.ip,
 		gr_r6->dest.prefixlen,
+		gr_r6->vrf_id,
 		&gr_r6->nh,
 		startup
 	);
 }
 
 enum zebra_dplane_result grout_add_del_route(struct zebra_dplane_ctx *ctx) {
+	// Drain sentinel: short-circuit before any field-level processing.
+	// Reaching this point on the dplane pthread means every earlier ctx
+	// in the FIFO has already been processed (including all sweep deletes).
+	if (grout_drain_sentinel_consume(ctx))
+		return ZEBRA_DPLANE_REQUEST_SUCCESS;
+
 	bool new = dplane_ctx_get_op(ctx) != DPLANE_OP_ROUTE_DELETE;
 	union {
 		struct gr_ip4_route_add_req r4_add;
@@ -510,6 +533,12 @@ enum zebra_dplane_result grout_add_del_route(struct zebra_dplane_ctx *ctx) {
 		gr_log_debug("non-frr origin, skip");
 		return ZEBRA_DPLANE_REQUEST_SUCCESS;
 	}
+
+	// Count SELFROUTE deletes for sweep instrumentation. Bumped before
+	// the round-trip to grout so the counter reflects the work attempted,
+	// not just the work that succeeded.
+	if (!new && (dplane_ctx_get_flags(ctx) & ZEBRA_FLAG_SELFROUTE))
+		grout_stats_selfroute_delete(p->family);
 
 	// Route was read from grout at startup and injected into zebra's RIB
 	// with ZEBRA_FLAG_SELFROUTE. Grout already has it, do not round-trip
@@ -592,9 +621,12 @@ enum zebra_dplane_result grout_add_del_route(struct zebra_dplane_ctx *ctx) {
 		dest->prefixlen = p->prefixlen;
 	}
 
-	if (grout_client_send_recv(req_type, req_len, &req, NULL) < 0)
+	if (grout_client_send_recv(req_type, req_len, &req, NULL) < 0) {
+		grout_stats_route_op(vrf_id, p->family, new, false);
 		return ZEBRA_DPLANE_REQUEST_FAILURE;
+	}
 
+	grout_stats_route_op(vrf_id, p->family, new, true);
 	return ZEBRA_DPLANE_REQUEST_SUCCESS;
 }
 

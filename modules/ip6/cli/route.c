@@ -147,6 +147,27 @@ static int route6_config_show(struct gr_api_client *c, uint16_t vrf_id, struct g
 	return ret;
 }
 
+static int route6_stats_show(struct gr_api_client *c, uint16_t vrf_id, struct gr_table *table) {
+	struct gr_ip6_route_stats_list_req req = {.vrf_id = vrf_id};
+	const struct gr_ip6_route_stats *stats;
+	int ret;
+
+	gr_api_client_stream_foreach (stats, ret, c, GR_IP6_ROUTE_STATS_LIST, sizeof(req), &req) {
+		gr_table_cell(table, 0, "%s", iface_name_from_id(c, stats->vrf_id));
+		gr_table_cell(table, 1, "%s", gr_af_name(GR_AF_IP6));
+		gr_table_cell(table, 2, "%s", gr_nh_origin_name(stats->origin));
+		gr_table_cell(table, 3, "%lu", stats->added);
+		gr_table_cell(table, 4, "%lu", stats->deleted);
+		gr_table_cell(table, 5, "%lu", stats->del_no_route);
+		gr_table_cell(table, 6, "%lu", stats->del_no_vrf);
+
+		if (gr_table_print_row(table) < 0)
+			break;
+	}
+
+	return ret;
+}
+
 static struct cli_route_ops route_ops = {
 	.af = GR_AF_IP6,
 	.add = route6_add,
@@ -155,6 +176,7 @@ static struct cli_route_ops route_ops = {
 	.get = route6_get,
 	.config_set = route6_config_set,
 	.config_show = route6_config_show,
+	.stats_show = route6_stats_show,
 };
 
 static void route_event_print(uint32_t event, const void *obj) {

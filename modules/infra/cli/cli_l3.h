@@ -40,6 +40,7 @@ struct cli_route_ops {
 	int (*list)(struct gr_api_client *, uint16_t vrf_id, struct gr_table *, uint16_t max);
 	cmd_cb_t config_set;
 	int (*config_show)(struct gr_api_client *, uint16_t vrf_id, struct gr_table *);
+	int (*stats_show)(struct gr_api_client *, uint16_t vrf_id, struct gr_table *);
 	STAILQ_ENTRY(cli_route_ops) next;
 };
 

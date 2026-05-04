@@ -15,10 +15,15 @@
 
 #include <fcntl.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <lib/bitfield.h>
+#include <lib/command.h>
 #include <lib/frr_pthread.h>
 #include <lib/libfrr.h>
 #include <lib/version.h>
+#include <lib/vty.h>
+#include <stdatomic.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <zebra/interface.h>
 #include <zebra/rib.h>
@@ -74,10 +79,98 @@ struct grout_ctx_t {
 	// -K value cached from /proc/self/cmdline. Same semantics as FRR's
 	// zebra_di.gr_cleanup_time: 0 means absent, positive means K seconds.
 	int gr_cleanup_time;
+
+	// Wall time stamped at the start of grout_sync (post-connect). Used
+	// to report end-to-end full-sync elapsed time when the marker is
+	// observed. tv_sec == 0 && tv_usec == 0 means no sync in flight.
+	struct timeval sync_start_tv;
 };
 
 static struct grout_ctx_t grout_ctx = {0};
 static const char *plugin_name = "zebra_dplane_grout";
+
+// Per-VRF cumulative counters for route ADD/UPDATE/DELETE ops the plugin
+// pushed to grout. Writes happen on the dplane pthread; the VTY reader
+// runs on the main thread, so accesses use relaxed atomics.
+struct grout_dplane_vrf_stats {
+	_Atomic uint64_t v4_added;
+	_Atomic uint64_t v4_deleted;
+	_Atomic uint64_t v4_failed;
+	_Atomic uint64_t v6_added;
+	_Atomic uint64_t v6_deleted;
+	_Atomic uint64_t v6_failed;
+};
+
+static struct grout_dplane_vrf_stats grout_route_stats[GR_MAX_IFACES];
+
+// SELFROUTE-only counters used to instrument the sweep path. inject is
+// the count handed to rib_add_multipath during the startup dump; delete
+// is what the provider's ctx-handler sees flow through. Sampling these
+// at end-of-sync and end-of-sweep gives a clean answer to "did inject
+// land?" and "did sweep delete what it should have?".
+static _Atomic uint64_t grout_stats_selfroute_inject_v4;
+static _Atomic uint64_t grout_stats_selfroute_inject_v6;
+static _Atomic uint64_t grout_stats_selfroute_inject_failed_v4;
+static _Atomic uint64_t grout_stats_selfroute_inject_failed_v6;
+static _Atomic uint64_t grout_stats_selfroute_delete_v4;
+static _Atomic uint64_t grout_stats_selfroute_delete_v6;
+
+void grout_stats_selfroute_inject(int family) {
+	if (family == AF_INET)
+		atomic_fetch_add_explicit(
+			&grout_stats_selfroute_inject_v4, 1, memory_order_relaxed
+		);
+	else if (family == AF_INET6)
+		atomic_fetch_add_explicit(
+			&grout_stats_selfroute_inject_v6, 1, memory_order_relaxed
+		);
+}
+
+void grout_stats_selfroute_inject_failed(int family) {
+	if (family == AF_INET)
+		atomic_fetch_add_explicit(
+			&grout_stats_selfroute_inject_failed_v4, 1, memory_order_relaxed
+		);
+	else if (family == AF_INET6)
+		atomic_fetch_add_explicit(
+			&grout_stats_selfroute_inject_failed_v6, 1, memory_order_relaxed
+		);
+}
+
+void grout_stats_selfroute_delete(int family) {
+	if (family == AF_INET)
+		atomic_fetch_add_explicit(
+			&grout_stats_selfroute_delete_v4, 1, memory_order_relaxed
+		);
+	else if (family == AF_INET6)
+		atomic_fetch_add_explicit(
+			&grout_stats_selfroute_delete_v6, 1, memory_order_relaxed
+		);
+}
+
+void grout_stats_route_op(uint32_t vrf_id, int family, bool add, bool ok) {
+	struct grout_dplane_vrf_stats *s;
+
+	if (vrf_id >= GR_MAX_IFACES)
+		return;
+
+	s = &grout_route_stats[vrf_id];
+	if (family == AF_INET) {
+		if (!ok)
+			atomic_fetch_add_explicit(&s->v4_failed, 1, memory_order_relaxed);
+		else if (add)
+			atomic_fetch_add_explicit(&s->v4_added, 1, memory_order_relaxed);
+		else
+			atomic_fetch_add_explicit(&s->v4_deleted, 1, memory_order_relaxed);
+	} else if (family == AF_INET6) {
+		if (!ok)
+			atomic_fetch_add_explicit(&s->v6_failed, 1, memory_order_relaxed);
+		else if (add)
+			atomic_fetch_add_explicit(&s->v6_added, 1, memory_order_relaxed);
+		else
+			atomic_fetch_add_explicit(&s->v6_deleted, 1, memory_order_relaxed);
+	}
+}
 
 // Parsed once from GROUT_SYNC_MARKER_PFX at zd_grout_plugin_init.
 // Reused by poll/cleanup/inject so str2prefix is only called (and
@@ -95,6 +188,7 @@ static void grout_reconnect(struct event *);
 static void grout_reconnect_finish(void);
 static void grout_sync_arm_sweep(void);
 static void grout_sync_cleanup_marker(void);
+static void grout_rib_sweep_wrapper(struct event *t);
 static void grout_sync_inject_marker(void);
 
 struct grout_evt {
@@ -264,6 +358,32 @@ static void grout_sync_dispatch_marker_cb(void) {
 static void grout_sync_arm_sweep(void) {
 	grout_sync_cleanup_marker();
 
+	if (timerisset(&grout_ctx.sync_start_tv)) {
+		int64_t us = monotime_since(&grout_ctx.sync_start_tv, NULL);
+		uint64_t v4 = atomic_load_explicit(
+			&grout_stats_selfroute_inject_v4, memory_order_relaxed
+		);
+		uint64_t v6 = atomic_load_explicit(
+			&grout_stats_selfroute_inject_v6, memory_order_relaxed
+		);
+		uint64_t v4f = atomic_load_explicit(
+			&grout_stats_selfroute_inject_failed_v4, memory_order_relaxed
+		);
+		uint64_t v6f = atomic_load_explicit(
+			&grout_stats_selfroute_inject_failed_v6, memory_order_relaxed
+		);
+		gr_log_info(
+			"full sync done (elapsed %lld ms): selfroutes scanned v4=%llu "
+			"(failed=%llu) v6=%llu (failed=%llu)",
+			(long long)(us / 1000),
+			(unsigned long long)v4,
+			(unsigned long long)v4f,
+			(unsigned long long)v6,
+			(unsigned long long)v6f
+		);
+		timerclear(&grout_ctx.sync_start_tv);
+	}
+
 	time_t old_startup_time = zrouter.startup_time;
 	zrouter.startup_time = monotime(NULL);
 	gr_log_debug(
@@ -280,7 +400,124 @@ static void grout_sync_arm_sweep(void) {
 			ZEBRA_GR_DEFAULT_RIB_SWEEP_TIME;
 	}
 	event_cancel(&zrouter.t_rib_sweep);
-	event_add_timer(zrouter.master, rib_sweep_route, NULL, delay, &zrouter.t_rib_sweep);
+	gr_log_info("arming rib_sweep_route in %ld s", delay);
+	event_add_timer(zrouter.master, grout_rib_sweep_wrapper, NULL, delay, &zrouter.t_rib_sweep);
+}
+
+// Drain sentinel: a synthetic ROUTE_DELETE ctx tagged with
+// GROUT_DRAIN_SENTINEL_TAG, enqueued at the tail of the dplane queue
+// (FIFO with sweep-enqueued deletes). Bypasses rib_add_multipath /
+// rib_process entirely: never enters zebra's RIB tree, never selected,
+// never triggers ZAPI redistribution. The grout provider recognises
+// the tag and short-circuits the round-trip. Observation in the
+// provider = end of drain. zebra-internals only; no grout-side state.
+static struct timeval grout_drain_start_tv;
+static bool grout_drain_inflight;
+static uint64_t grout_drain_baseline_v4_del;
+static uint64_t grout_drain_baseline_v6_del;
+
+// Stub nexthop_group_hash_entry. dplane_ctx_route_init dereferences
+// re->nhe at zebra_dplane.c:3856-3858 (copy_nexthops + nhe->id). With
+// flags=0 zebra_nhg_resolve() returns the nhe as-is; backup_info=NULL
+// keeps the optional backup-copy branch silent. The nh attached has
+// no ifindex, so the optional dplane_collect_extra_intf_info path is
+// also a no-op.
+static struct nexthop grout_drain_stub_nh = {
+	.type = NEXTHOP_TYPE_BLACKHOLE,
+	.bh_type = BLACKHOLE_NULL,
+	.vrf_id = VRF_DEFAULT,
+};
+static struct nhg_hash_entry grout_drain_stub_nhe = {
+	.id = 0,
+	.nhg = {.nexthop = &grout_drain_stub_nh},
+};
+
+static void grout_drain_sentinel_inject(void) {
+	struct route_entry *re;
+	struct route_table *table;
+	struct route_node *rn;
+	struct prefix p = {
+		.family = AF_INET,
+		.prefixlen = 32,
+		.u.prefix4.s_addr = htonl(0xC63364FEU), // 198.51.100.254 (TEST-NET-2)
+	};
+
+	table = zebra_vrf_table(AFI_IP, SAFI_UNICAST, VRF_DEFAULT);
+	if (!table) {
+		gr_log_warn("drain sentinel: no default VRF ipv4 table");
+		return;
+	}
+
+	monotime(&grout_drain_start_tv);
+	grout_drain_inflight = true;
+	grout_drain_baseline_v4_del = atomic_load_explicit(
+		&grout_stats_selfroute_delete_v4, memory_order_relaxed
+	);
+	grout_drain_baseline_v6_del = atomic_load_explicit(
+		&grout_stats_selfroute_delete_v6, memory_order_relaxed
+	);
+
+	re = zebra_rib_route_entry_new(
+		VRF_DEFAULT, ZEBRA_ROUTE_SHARP, 0, 0, 0, 0, 0, 0, 100, GROUT_DRAIN_SENTINEL_TAG
+	);
+	re->nhe = &grout_drain_stub_nhe;
+
+	// route_node_get inserts a transient node into the table; it is
+	// freed when route_unlock_node drops the last ref (no re attached).
+	rn = route_node_get(table, &p);
+	dplane_route_delete(rn, re);
+	route_unlock_node(rn);
+
+	// dplane_ctx_route_init copied everything it needs out of re; safe
+	// to free. nhe is statically allocated, do not free.
+	re->nhe = NULL;
+	zebra_rib_route_entry_free(re);
+}
+
+bool grout_drain_sentinel_consume(const struct zebra_dplane_ctx *ctx) {
+	if (dplane_ctx_get_tag(ctx) != GROUT_DRAIN_SENTINEL_TAG)
+		return false;
+
+	if (grout_drain_inflight) {
+		int64_t us = monotime_since(&grout_drain_start_tv, NULL);
+		uint64_t v4 = atomic_load_explicit(
+			&grout_stats_selfroute_delete_v4, memory_order_relaxed
+		);
+		uint64_t v6 = atomic_load_explicit(
+			&grout_stats_selfroute_delete_v6, memory_order_relaxed
+		);
+		gr_log_info(
+			"sweep dplane drain done (elapsed %lld ms): selfroutes deleted v4=%llu "
+			"v6=%llu",
+			(long long)(us / 1000),
+			(unsigned long long)(v4 - grout_drain_baseline_v4_del),
+			(unsigned long long)(v6 - grout_drain_baseline_v6_del)
+		);
+		grout_drain_inflight = false;
+	}
+	return true;
+}
+
+// Wrap rib_sweep_route. The walk itself is in-memory and finishes fast;
+// each candidate is pushed via dplane_route_delete which only enqueues.
+// Physical deletes drain asynchronously on the dplane pthread (one sync
+// gr_api_client_send_recv per ctx). After the walk, inject a SHARP-tag
+// sentinel that rides at the tail of the dplane queue: when the grout
+// provider observes it, every earlier ctx has been processed.
+static void grout_rib_sweep_wrapper(struct event *t) {
+	struct timeval start;
+	monotime(&start);
+	gr_log_info("rib_sweep_route starting");
+
+	rib_sweep_route(t);
+
+	int64_t walk_us = monotime_since(&start, NULL);
+	gr_log_info(
+		"rib_sweep_route walk done (elapsed %lld ms); deletes drain async",
+		(long long)(walk_us / 1000)
+	);
+
+	grout_drain_sentinel_inject();
 }
 
 // Poll the RIB for our marker. FIFO ordering of META_QUEUE_EARLY_ROUTE
@@ -631,6 +868,9 @@ static void grout_sync(struct event *) {
 		event_add_timer(zrouter.master, grout_sync, NULL, 1, &grout_ctx.dg_t_sync);
 		return;
 	}
+
+	monotime(&grout_ctx.sync_start_tv);
+	gr_log_info("full sync starting");
 
 	// grout is available, schedule notification channels and sync
 	event_add_timer(dplane_get_thread_master(), dplane_grout_connect, NULL, 0, NULL);
@@ -1081,6 +1321,56 @@ static int zd_grout_finish(struct zebra_dplane_provider *, bool early) {
 	return 0;
 }
 
+DEFUN(show_dplane_grout_stats,
+      show_dplane_grout_stats_cmd,
+      "show dplane grout stats",
+      SHOW_STR
+      "Data plane information\n"
+      "grout dataplane provider\n"
+      "Statistics\n") {
+	bool any = false;
+
+	vty_out(vty,
+		"%-6s %-12s %-12s %-12s %-12s %-12s %-12s\n",
+		"VRF",
+		"v4_added",
+		"v4_deleted",
+		"v4_failed",
+		"v6_added",
+		"v6_deleted",
+		"v6_failed");
+
+	for (uint32_t i = 0; i < GR_MAX_IFACES; i++) {
+		struct grout_dplane_vrf_stats *s = &grout_route_stats[i];
+		uint64_t v4a = atomic_load_explicit(&s->v4_added, memory_order_relaxed);
+		uint64_t v4d = atomic_load_explicit(&s->v4_deleted, memory_order_relaxed);
+		uint64_t v4f = atomic_load_explicit(&s->v4_failed, memory_order_relaxed);
+		uint64_t v6a = atomic_load_explicit(&s->v6_added, memory_order_relaxed);
+		uint64_t v6d = atomic_load_explicit(&s->v6_deleted, memory_order_relaxed);
+		uint64_t v6f = atomic_load_explicit(&s->v6_failed, memory_order_relaxed);
+
+		if (!(v4a || v4d || v4f || v6a || v6d || v6f))
+			continue;
+
+		vty_out(vty,
+			"%-6u %-12" PRIu64 " %-12" PRIu64 " %-12" PRIu64 " %-12" PRIu64
+			" %-12" PRIu64 " %-12" PRIu64 "\n",
+			i,
+			v4a,
+			v4d,
+			v4f,
+			v6a,
+			v6d,
+			v6f);
+		any = true;
+	}
+
+	if (!any)
+		vty_out(vty, "(no route activity)\n");
+
+	return CMD_SUCCESS;
+}
+
 static int zd_grout_plugin_init(struct event_loop *) {
 	int ret;
 
@@ -1100,6 +1390,8 @@ static int zd_grout_plugin_init(struct event_loop *) {
 
 	gr_log_debug("%s register status %d", plugin_name, ret);
 
+	install_element(VIEW_NODE, &show_dplane_grout_stats_cmd);
+
 	// Parse the marker prefix once. Hardcoded constant: failure is a
 	// build-time mistake in GROUT_SYNC_MARKER_PFX.
 	assert(str2prefix(GROUT_SYNC_MARKER_PFX, &grout_sync_marker_prefix) == 1);
@@ -1112,7 +1404,7 @@ static int zd_grout_plugin_init(struct event_loop *) {
 	// pointer is non-NULL (lib/event.c:1430).
 	event_add_timer(
 		zrouter.master,
-		rib_sweep_route,
+		grout_rib_sweep_wrapper,
 		NULL,
 		GROUT_SYNC_SWEEP_PLACEHOLDER_SEC,
 		&zrouter.t_rib_sweep

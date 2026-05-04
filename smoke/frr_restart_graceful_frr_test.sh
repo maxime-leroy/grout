@@ -69,9 +69,14 @@ set_ip_route --persist $prefix_kept $nh_ip
 # Reachability for the SID block + SR6_OUTPUT prefixes.
 set_ip_route fd00:202::/32 $nh6_ip
 set_ip_route --persist fd00:202::/32 $nh6_ip
-set_srv6_route $sr6_orphan p0 $sr6_orphan_sid
-set_srv6_route $sr6_kept p0 $sr6_kept_sid
-set_srv6_route --persist $sr6_kept p0 $sr6_kept_sid
+# L3VPN shape: customer prefix in vrf2, encap nexthop on p0 in default.
+# This is the cross-vrf encap case (route.vrf != nh.vrf) that the dump
+# path must preserve through restart; without the gr_r4->vrf_id fix in
+# rt_grout.c, the prefix gets re-injected into zebra's main vrf at
+# startup and sweep then misses the real entry in grout's vrf2.
+set_srv6_route --vrf vrf2 $sr6_orphan p0 $sr6_orphan_sid
+set_srv6_route --vrf vrf2 $sr6_kept p0 $sr6_kept_sid
+set_srv6_route --persist --vrf vrf2 $sr6_kept p0 $sr6_kept_sid
 
 # SR6_LOCAL static-SIDs. Two SIDs need two distinct (behavior, vrf)
 # contexts: the orphan decaps into the default VRF, the kept one
@@ -142,7 +147,7 @@ frrinit.sh restart
 
 # Orphans get swept, reclaimed routes must NOT emit a grout del event.
 wait_event -t 15 "route4 del: vrf=main $prefix_orphan"
-wait_event -t 15 "route4 del: vrf=main $sr6_orphan"
+wait_event -t 15 "route4 del: vrf=vrf2 $sr6_orphan"
 wait_event -t 15 "route6 del: vrf=main $sr6_localsid_orphan/48"
 
 grcli -j route show | jq -e \
@@ -171,10 +176,10 @@ grcli -j route show | jq -e \
 vtysh -c "show ip route $prefix_kept" 2>/dev/null \
 	| grep -qE 'Known via "static"' \
 	|| fail "$prefix_kept is not a static route in zebra RIB after reclaim"
-vtysh -c "show ip route $sr6_kept" 2>/dev/null \
+vtysh -c "show ip route vrf vrf2 $sr6_kept" 2>/dev/null \
 	| grep -qE 'Known via "static"' \
-	|| fail "$sr6_kept is not a static route in zebra RIB after reclaim"
-vtysh -c "show ip route $sr6_kept json" 2>/dev/null \
+	|| fail "$sr6_kept is not a static route in zebra vrf2 RIB after reclaim"
+vtysh -c "show ip route vrf vrf2 $sr6_kept json" 2>/dev/null \
 	| jq -e ".\"$sr6_kept\"[].nexthops[] | select(.seg6.segs == \"$sr6_kept_sid\")" \
 	>/dev/null \
 	|| fail "$sr6_kept lost its seg6 SID after reclaim"
@@ -193,10 +198,13 @@ out=$(vtysh -c "show ipv6 route ::/128 json" 2>/dev/null)
 
 # zebra's RIB must contain exactly the static routes declared in frr.conf
 # ($prefix_kept was appended; $prefix_orphan was vty-only and must be swept).
+# Count across all VRFs since the SR6 L3VPN entry lives in vrf2.
 expected=$(grep -cE '^[[:space:]]*ip route ' "$builddir/frr_install/etc/frr/frr.conf" || true)
-actual=$(vtysh -c "show ip route static json" 2>/dev/null | jq 'length // 0')
+actual_default=$(vtysh -c "show ip route static json" 2>/dev/null | jq 'length // 0')
+actual_vrf2=$(vtysh -c "show ip route vrf vrf2 static json" 2>/dev/null | jq 'length // 0')
+actual=$((actual_default + actual_vrf2))
 [ "$expected" = "$actual" ] \
-	|| fail "static route count mismatch: expected $expected from frr.conf, got $actual"
+	|| fail "static route count mismatch: expected $expected from frr.conf, got $actual (default=$actual_default vrf2=$actual_vrf2)"
 
 # Sweep ran exactly once: the placeholder pre-arm in zd_grout_plugin_init
 # neutralised zebra_main_router_started's native arm (event_add_timer

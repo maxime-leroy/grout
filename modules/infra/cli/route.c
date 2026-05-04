@@ -143,6 +143,38 @@ static cmd_status_t route_config_show(struct gr_api_client *c, const struct ec_p
 	return ret < 0 ? CMD_ERROR : CMD_SUCCESS;
 }
 
+static cmd_status_t route_stats_show(struct gr_api_client *c, const struct ec_pnode *p) {
+	uint16_t vrf_id = GR_VRF_ID_UNDEF;
+	addr_family_t af = cli_parse_family(p);
+	struct cli_route_ops *ops;
+	int ret = 0;
+
+	if (arg_str(p, "VRF") != NULL && arg_vrf(c, p, "VRF", &vrf_id) < 0)
+		return CMD_ERROR;
+
+	struct gr_table *table = gr_table_new();
+	gr_table_column(table, "VRF", GR_DISP_LEFT); // 0
+	gr_table_column(table, "FAMILY", GR_DISP_LEFT); // 1
+	gr_table_column(table, "ORIGIN", GR_DISP_LEFT); // 2
+	gr_table_column(table, "ADDED", GR_DISP_RIGHT); // 3
+	gr_table_column(table, "DELETED", GR_DISP_RIGHT); // 4
+	gr_table_column(table, "DEL_NO_ROUTE", GR_DISP_RIGHT); // 5
+	gr_table_column(table, "DEL_NO_VRF", GR_DISP_RIGHT); // 6
+
+	STAILQ_FOREACH (ops, &route_ops, next) {
+		if (ops->stats_show == NULL)
+			continue;
+		if (af != GR_AF_UNSPEC && ops->af != af)
+			continue;
+		if ((ret = ops->stats_show(c, vrf_id, table)) < 0)
+			break;
+	}
+
+	gr_table_free(table);
+
+	return ret < 0 ? CMD_ERROR : CMD_SUCCESS;
+}
+
 static cmd_status_t route_get(struct gr_api_client *c, const struct ec_pnode *p) {
 	struct cli_route_ops *ops;
 	uint8_t ip[64];
@@ -218,6 +250,20 @@ static int ctx_init(struct ec_node *root) {
 		CLI_FAMILY_NODE(
 			"Only show IPv4 FIB configuration.", "Only show IPv6 FIB configuration."
 		),
+		with_help("L3 routing domain name.", ec_node_dyn("VRF", complete_vrf_names, NULL))
+	);
+	if (ret < 0)
+		return ret;
+	// Register before route_list: the latter's grammar is fully optional
+	// ("[show] [(FAMILY),...]") and ec_node_or matches first-success, so
+	// route_list would silently match the empty set for `route stats ...`
+	// and shadow this command.
+	ret = CLI_COMMAND(
+		ROUTE_CTX(root),
+		"stats [FAMILY] [vrf VRF]",
+		route_stats_show,
+		"Show cumulative route ADD/DEL counters by VRF and origin.",
+		CLI_FAMILY_NODE("Only show IPv4 route stats.", "Only show IPv6 route stats."),
 		with_help("L3 routing domain name.", ec_node_dyn("VRF", complete_vrf_names, NULL))
 	);
 	if (ret < 0)
