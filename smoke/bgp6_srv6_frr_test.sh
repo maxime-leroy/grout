@@ -17,7 +17,7 @@
 # |           frr-bgp-peer          |    |           FRR + Grout             |
 # |                                 |    |                                   |
 # |                                 |    |                                   |
-# |      vrf 1                      |    |                       gr-vrf1     |
+# |      vrf-vpn4                   |    |                       vrf-vpn4   |
 # | +------------+  +-------------+ |    | +-------------+   +-------------+ |
 # | | to-host-a  |  |   x-p0      | |    | |     p0      |   |     p1      | |
 # +-+            +--+             +-+    +-+             +---+             +-+
@@ -37,10 +37,10 @@
 
 . $(dirname $0)/_init_frr.sh
 
-create_vrf gr-vrf1
+create_vrf vrf-vpn4
 
 create_interface p0
-create_interface p1 vrf gr-vrf1
+create_interface p1 vrf vrf-vpn4
 
 set_ip_address p0 fd00:102::2/64
 set_ip_address p1 16.1.0.1/24
@@ -79,16 +79,16 @@ ip -n ns-a route add default via 16.0.0.1
 
 # Configure FRR BGP peer router
 ip -n ns-a link set to-host-a netns bgp-peer
-ip -n bgp-peer link add vrf1 type vrf table 1000
-ip -n bgp-peer link set vrf1 up
-ip -n bgp-peer link set to-host-a master vrf1
+ip -n bgp-peer link add vrf-vpn4 type vrf table 1000
+ip -n bgp-peer link set vrf-vpn4 up
+ip -n bgp-peer link set to-host-a master vrf-vpn4
 ip -n bgp-peer link set to-host-a up
 
 vtysh -N bgp-peer <<-EOF
 configure terminal
 
-interface vrf1
- vrf vrf1
+interface vrf-vpn4
+ vrf vrf-vpn4
 exit
 
 interface x-p0
@@ -125,7 +125,7 @@ router bgp 64512
  exit
 exit
 
-router bgp 64512 vrf vrf1
+router bgp 64512 vrf vrf-vpn4
  bgp router-id 176.16.0.201
  no bgp default ipv4-unicast
 
@@ -171,7 +171,7 @@ router bgp 64512
  exit
 exit
 
-router bgp 64512 vrf gr-vrf1
+router bgp 64512 vrf vrf-vpn4
  bgp router-id 172.16.0.101
  no bgp default ipv4-unicast
 
@@ -210,7 +210,7 @@ while ! grcli -j route show | jq -e "$jq_expr"; do
 done
 
 attempts=0
-while ! vtysh -N bgp-peer -c "show ip route vrf vrf1" | grep -q "B>\* 16.1.0.0/24 .*seg6" ; do
+while ! vtysh -N bgp-peer -c "show ip route vrf vrf-vpn4" | grep -q "B>\* 16.1.0.0/24 .*seg6" ; do
 	if [ "$attempts" -ge 40 ]; then
 		fail "BGP seg6 route not learned in FRR BGP Peer"
 	fi
@@ -230,3 +230,7 @@ done
 # Verify host-a can ping host-b
 ip netns exec ns-a ping -i0.01 -c3 -n 16.1.0.2
 ip netns exec ns-b ping -i0.01 -c3 -n 16.0.0.2
+
+if [ "${DEMO:-false}" = true ]; then
+	bash $(dirname $0)/demo_bgp6_srv6_kde.sh
+fi
