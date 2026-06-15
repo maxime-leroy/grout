@@ -76,7 +76,8 @@ static struct rte_eth_conf default_port_config = {
 			.rss_hf = RTE_ETH_RSS_VLAN
 				| RTE_ETH_RSS_IP
 				| RTE_ETH_RSS_UDP
-				| RTE_ETH_RSS_TCP,
+				| RTE_ETH_RSS_TCP
+				| RTE_ETH_RSS_LEVEL_INNERMOST,
 		},
 	},
 	.rxmode = {
