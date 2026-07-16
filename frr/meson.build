@@ -15,6 +15,10 @@ frr_dep = dependency(
   fallback: ['frr-' + frr_version, 'frr_dep'],
 )
 
+if not frr_dep.found()
+  subdir_done()
+endif
+
 install_build_flag = frr_dep.get_variable('install_on_build', default_value: 'false') == 'true'
 frr_moduledir = frr_dep.get_variable('moduledir')
 
