@@ -23,6 +23,10 @@ struct queue_map {
 
 #define GR_MAX_NODE_XSTATS 4
 
+// wakeup_fd encoding: a plain wakeup writes 1; a re-arm kick sets a high bit so
+// the napi worker re-registers its rxqs after reading it.
+#define WORKER_KICK_REARM (1ULL << 32)
+
 struct node_stats {
 	rte_node_t node_id;
 	rte_node_t parent_id;
@@ -89,6 +93,12 @@ int worker_queue_distribute(const cpu_set_t *affinity, vec struct iface_info_por
 void worker_wait_wakeup(struct worker *);
 void worker_wakeup(struct worker *);
 void worker_wakeup_all(void);
+void worker_wakeup_any(void);
+void worker_rearm_all(void);
+
+// Number of workers running the graph; post_to_stack reads it to decide whether
+// to kick an idle worker to drain the control input ring.
+extern atomic_uint gr_worker_active;
 vec struct gr_stat *worker_dump_stats(uint16_t cpu_id);
 
 int port_unplug(struct iface_info_port *);

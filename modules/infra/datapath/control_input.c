@@ -7,6 +7,9 @@
 #include "mbuf.h"
 #include "mempool.h"
 #include "trace.h"
+#include "worker.h"
+
+#include <stdatomic.h>
 
 LOG_TYPE("graph");
 
@@ -47,7 +50,16 @@ int post_to_stack(control_input_t type, void *data) {
 	if (ret < 0)
 		return errno_set(-ret);
 
+	// no worker is running the graph: kick one so the injected packet is drained.
+	// seq_cst orders the enqueue before the active-count read (eventcount).
+	if (atomic_load_explicit(&gr_worker_active, memory_order_seq_cst) == 0)
+		worker_wakeup_any();
+
 	return 0;
+}
+
+bool control_input_pending(void) {
+	return rte_ring_count(control_input_ring) > 0;
 }
 
 static uint16_t control_input_process(

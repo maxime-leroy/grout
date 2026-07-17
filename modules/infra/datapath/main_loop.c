@@ -2,6 +2,7 @@
 // Copyright (c) 2023 Robin Jarry
 
 #include "config.h"
+#include "control_input.h"
 #include "datapath.h"
 #include "log.h"
 #include "module.h"
@@ -201,6 +202,7 @@ napi_wait(struct worker *w, vec struct queue_map *rxqs, vec struct queue_map **r
 	vec struct queue_map *armed = NULL;
 	struct queue_map *qm, *e;
 	int ret, status = 0;
+	bool rearm = false;
 
 	// add the wakeup_fd to the same per-thread epfd rte_epoll_wait uses; done here,
 	// not at worker start, so it lands on the epfd the block actually uses.
@@ -256,27 +258,33 @@ napi_wait(struct worker *w, vec struct queue_map *rxqs, vec struct queue_map **r
 			vec_add(*registered, *qm);
 	}
 
-	// a packet may have arrived while arming; recheck and resume polling instead
-	// of blocking. rx_queue_count is safe against a concurrent stop (returns -ENOTSUP).
+	// about to block: drop the active count, then recheck the ring and rxqs so a
+	// packet that arrived while arming resumes polling. seq_cst pairs post_to_stack.
+	atomic_fetch_sub_explicit(&gr_worker_active, 1, memory_order_seq_cst);
+	if (control_input_pending())
+		goto wake;
 	vec_foreach_ref (qm, armed) {
 		if (rte_eth_rx_queue_count(qm->port_id, qm->queue_id) > 0)
-			goto disarm;
+			goto wake;
 	}
 
 	rte_rcu_qsbr_thread_offline(rcu, rte_lcore_id());
 	rte_epoll_wait(RTE_EPOLL_PER_THREAD, events, NAPI_MAX_EVENTS, -1);
 	rte_rcu_qsbr_thread_online(rcu, rte_lcore_id());
 
-	// drain the wakeup_fd; a kick means a reconfig/shutdown or a port stop/start,
-	// which may have dropped our rxq epoll registration, so re-register next time.
+	// drain the wakeup_fd; a WORKER_KICK_REARM (high bit) means our rxq epoll
+	// registration was dropped, so re-register next time.
 	uint64_t kick;
-	if (read(w->wakeup_fd, &kick, sizeof(kick)) > 0) {
+	while (read(w->wakeup_fd, &kick, sizeof(kick)) > 0)
+		if (kick >= WORKER_KICK_REARM)
+			rearm = true;
+	if (rearm) {
 		vec_free(*registered);
 		*registered = NULL;
-		while (read(w->wakeup_fd, &kick, sizeof(kick)) > 0)
-			;
 	}
 
+wake:
+	atomic_fetch_add_explicit(&gr_worker_active, 1, memory_order_seq_cst);
 disarm:
 	vec_foreach_ref (e, armed)
 		rte_eth_dev_rx_intr_disable(e->port_id, e->queue_id);
@@ -374,6 +382,8 @@ reconfig:
 	napi_rxqs = NULL;
 	for (uint32_t i = 0; i < vec_len(w->rxqs); i++)
 		vec_add(napi_rxqs, w->rxqs[i]);
+	// this worker now runs the graph and drains the control input ring
+	atomic_fetch_add_explicit(&gr_worker_active, 1, memory_order_seq_cst);
 	for (;;) {
 		rte_graph_walk(graph);
 
@@ -383,6 +393,9 @@ reconfig:
 			rte_rcu_qsbr_quiescent(rcu, rte_lcore_id());
 
 			if (atomic_load(&w->shutdown) || atomic_load(&w->next_config) != cur) {
+				atomic_fetch_sub_explicit(
+					&gr_worker_active, 1, memory_order_seq_cst
+				);
 				rte_rcu_qsbr_thread_offline(rcu, rte_lcore_id());
 				goto reconfig;
 			}
