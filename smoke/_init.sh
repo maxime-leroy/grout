@@ -307,6 +307,9 @@ grout_extra_options=""
 if [ "$test_frr" = true ] && [ "$run_frr" = true ]; then
 	grout_extra_options+="-m 0666"
 fi
+if [ "${napi:-false}" = true ]; then
+	grout_extra_options+=" -n"
+fi
 
 cat >> $tmp/cleanup <<EOF
 echo ================== CLEANUP ==================
