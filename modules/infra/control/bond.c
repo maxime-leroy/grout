@@ -333,6 +333,8 @@ void bond_update_active_members(struct iface *iface) {
 	}
 
 	vec_free(active_ids);
+	// wake idle napi workers so the datapath observes the new active member
+	worker_wakeup_all();
 }
 
 static int bond_up_down(struct iface *iface, bool up) {

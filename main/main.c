@@ -65,6 +65,11 @@ static void usage(void) {
 	puts("  -m, --socket-mode PERMISSIONS  API socket file permissions (Default: 0660).");
 	puts("  -o, --socket-owner USER:GROUP  API socket file ownership");
 	puts("  -p, --poll-mode                Disable automatic micro-sleep.");
+	puts("  -n, --napi                     Adaptive interrupt (NAPI) rx: idle");
+	puts("                                 workers block on rxq interrupts");
+	puts("                                 instead of polling. Falls back to the");
+	puts("                                 micro-sleep ramp without HW support,");
+	puts("                                 unless --poll-mode is also given.");
 	puts("  -s, --socket PATH              Path the control plane API socket.");
 	puts("                                 Default: GROUT_SOCK_PATH from env or");
 	printf("                                 %s).\n", GR_DEFAULT_SOCK_PATH);
@@ -185,11 +190,12 @@ static bool parse_bool_env(const char *name) {
 static int parse_args(int argc, char **argv) {
 	int c;
 
-#define FLAGS ":M:Vhm:o:pSs:tu:vx"
+#define FLAGS ":M:Vhm:no:pSs:tu:vx"
 	static struct option long_options[] = {
 		{"help", no_argument, NULL, 'h'},
 		{"max-mtu", required_argument, NULL, 'u'},
 		{"metrics", required_argument, NULL, 'M'},
+		{"napi", no_argument, NULL, 'n'},
 		{"poll-mode", no_argument, NULL, 'p'},
 		{"socket", required_argument, NULL, 's'},
 		{"socket-mode", required_argument, NULL, 'm'},
@@ -232,6 +238,9 @@ static int parse_args(int argc, char **argv) {
 			break;
 		case 'p':
 			gr_config.poll_mode = true;
+			break;
+		case 'n':
+			gr_config.napi = true;
 			break;
 		case 'M':
 			if (parse_metrics_addr(optarg) < 0)
