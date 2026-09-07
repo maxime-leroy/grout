@@ -44,15 +44,18 @@ flow_hash_l3l4(const struct rte_mbuf *m, uint32_t l3_offset, rte_be16_t eth_type
 		const struct rte_tcp_hdr *tcp;
 	} l4;
 	uint32_t len;
+	bool frag;
 
 	switch (eth_type) {
 	case RTE_BE16(RTE_ETHER_TYPE_IPV4):
 		l3.ip4 = rte_pktmbuf_mtod_offset(m, const struct rte_ipv4_hdr *, l3_offset);
 		tuple.v4.src_addr = l3.ip4->src_addr;
 		tuple.v4.dst_addr = l3.ip4->dst_addr;
+		frag = l3.ip4->fragment_offset
+			& RTE_BE16(RTE_IPV4_HDR_MF_FLAG | RTE_IPV4_HDR_OFFSET_MASK);
 		switch (l3.ip4->next_proto_id) {
 		case IPPROTO_UDP:
-			if (l3.ip4->fragment_offset == 0) {
+			if (!frag) {
 				l4.udp = rte_pktmbuf_mtod_offset(
 					m,
 					const struct rte_udp_hdr *,
@@ -67,7 +70,7 @@ flow_hash_l3l4(const struct rte_mbuf *m, uint32_t l3_offset, rte_be16_t eth_type
 			}
 			break;
 		case IPPROTO_TCP:
-			if (l3.ip4->fragment_offset == 0) {
+			if (!frag) {
 				l4.tcp = rte_pktmbuf_mtod_offset(
 					m,
 					const struct rte_tcp_hdr *,
