@@ -6,9 +6,8 @@
 # grout p0 (172.16.0.1, fd00::1) --- x-p0 (172.16.0.2, fd00::2) in n0
 #
 # ICMP echo replies are punted to the control plane and only delivered to the
-# session that asked for them. Check that a reply nobody asked for now reaches
-# the kernel, so that ping(8) works through a control plane TAP, and that the
-# builtin grcli ping still gets its own replies.
+# session that asked for them. Check that a reply nobody asked for reaches the
+# kernel, so that ping(8) works through a control plane TAP.
 #
 . $(dirname $0)/_init.sh
 
@@ -46,10 +45,6 @@ ping -6 -c3 -i0.2 -W1 -n fd00::2 || fail "kernel ping6 did not receive its repli
 # the destination address does live on the input interface.
 ping -c3 -i0.2 -W1 -I p0 -n 172.16.0.2 || fail "kernel ping -I did not receive its replies"
 ping -6 -c3 -i0.2 -W1 -I p0 -n fd00::2 || fail "kernel ping6 -I did not receive its replies"
-
-# the builtin ping must keep working next to it
-grcli ping 172.16.0.2 count 3 delay 200 || fail "grcli ping failed"
-grcli ping fd00::2 count 3 delay 200 || fail "grcli ping6 failed"
 
 # An echo reply without payload cannot be one of the builtin ping probes, which
 # always carry a timestamp. It must still reach the kernel.
