@@ -27,7 +27,12 @@ static inline uint32_t flow_hash_words(uint32_t *tuple, uint32_t n_words) {
 	return rte_softrss_be(tuple, n_words, rss_key);
 }
 
-// Hash the L3/L4 tuple at l3_offset. False if eth_type is not IPv4 or IPv6.
+// Both rte_udp_hdr and rte_tcp_hdr start with the source and destination
+// ports, which is all this hash reads past L3.
+#define FLOW_HASH_PORTS_LEN (2 * sizeof(rte_be16_t))
+
+// Hash the L3/L4 tuple at l3_offset. False if eth_type is not IPv4 or IPv6,
+// or if the L3 header is not entirely in the first segment.
 static inline bool
 flow_hash_l3l4(const struct rte_mbuf *m, uint32_t l3_offset, rte_be16_t eth_type, uint32_t *hash) {
 	union {
@@ -44,10 +49,18 @@ flow_hash_l3l4(const struct rte_mbuf *m, uint32_t l3_offset, rte_be16_t eth_type
 		const struct rte_tcp_hdr *tcp;
 	} l4;
 	uint32_t len;
+	uint32_t avail;
 	bool frag;
+
+	avail = rte_pktmbuf_data_len(m);
+	if (avail < l3_offset)
+		return false;
+	avail -= l3_offset;
 
 	switch (eth_type) {
 	case RTE_BE16(RTE_ETHER_TYPE_IPV4):
+		if (avail < sizeof(*l3.ip4))
+			return false;
 		l3.ip4 = rte_pktmbuf_mtod_offset(m, const struct rte_ipv4_hdr *, l3_offset);
 		tuple.v4.src_addr = l3.ip4->src_addr;
 		tuple.v4.dst_addr = l3.ip4->dst_addr;
@@ -55,7 +68,7 @@ flow_hash_l3l4(const struct rte_mbuf *m, uint32_t l3_offset, rte_be16_t eth_type
 			& RTE_BE16(RTE_IPV4_HDR_MF_FLAG | RTE_IPV4_HDR_OFFSET_MASK);
 		switch (l3.ip4->next_proto_id) {
 		case IPPROTO_UDP:
-			if (!frag) {
+			if (!frag && avail >= rte_ipv4_hdr_len(l3.ip4) + FLOW_HASH_PORTS_LEN) {
 				l4.udp = rte_pktmbuf_mtod_offset(
 					m,
 					const struct rte_udp_hdr *,
@@ -64,13 +77,14 @@ flow_hash_l3l4(const struct rte_mbuf *m, uint32_t l3_offset, rte_be16_t eth_type
 				tuple.v4.sport = l4.udp->src_port;
 				tuple.v4.dport = l4.udp->dst_port;
 			} else {
-				// ignore UDP header for IP fragments
+				// ignore the UDP header of a fragment or of a
+				// packet too short to carry it
 				tuple.v4.sport = 0;
 				tuple.v4.dport = 0;
 			}
 			break;
 		case IPPROTO_TCP:
-			if (!frag) {
+			if (!frag && avail >= rte_ipv4_hdr_len(l3.ip4) + FLOW_HASH_PORTS_LEN) {
 				l4.tcp = rte_pktmbuf_mtod_offset(
 					m,
 					const struct rte_tcp_hdr *,
@@ -79,7 +93,8 @@ flow_hash_l3l4(const struct rte_mbuf *m, uint32_t l3_offset, rte_be16_t eth_type
 				tuple.v4.sport = l4.tcp->src_port;
 				tuple.v4.dport = l4.tcp->dst_port;
 			} else {
-				// ignore TCP header for IP fragments
+				// ignore the TCP header of a fragment or of a
+				// packet too short to carry it
 				tuple.v4.sport = 0;
 				tuple.v4.dport = 0;
 			}
@@ -91,27 +106,30 @@ flow_hash_l3l4(const struct rte_mbuf *m, uint32_t l3_offset, rte_be16_t eth_type
 		len = sizeof(tuple.v4);
 		break;
 	case RTE_BE16(RTE_ETHER_TYPE_IPV6):
+		if (avail < sizeof(*l3.ip6))
+			return false;
 		l3.ip6 = rte_pktmbuf_mtod_offset(m, const struct rte_ipv6_hdr *, l3_offset);
 		tuple.v6.src_addr = l3.ip6->src_addr;
 		tuple.v6.dst_addr = l3.ip6->dst_addr;
-		switch (l3.ip6->proto) {
-		case IPPROTO_UDP:
-			l4.udp = rte_pktmbuf_mtod_offset(
-				m, const struct rte_udp_hdr *, l3_offset + sizeof(*l3.ip6)
-			);
-			tuple.v6.sport = l4.udp->src_port;
-			tuple.v6.dport = l4.udp->dst_port;
-			break;
-		case IPPROTO_TCP:
-			l4.tcp = rte_pktmbuf_mtod_offset(
-				m, const struct rte_tcp_hdr *, l3_offset + sizeof(*l3.ip6)
-			);
-			tuple.v6.sport = l4.tcp->src_port;
-			tuple.v6.dport = l4.tcp->dst_port;
-			break;
-		default:
-			tuple.v6.sport = 0;
-			tuple.v6.dport = 0;
+		tuple.v6.sport = 0;
+		tuple.v6.dport = 0;
+		if (avail >= sizeof(*l3.ip6) + FLOW_HASH_PORTS_LEN) {
+			switch (l3.ip6->proto) {
+			case IPPROTO_UDP:
+				l4.udp = rte_pktmbuf_mtod_offset(
+					m, const struct rte_udp_hdr *, l3_offset + sizeof(*l3.ip6)
+				);
+				tuple.v6.sport = l4.udp->src_port;
+				tuple.v6.dport = l4.udp->dst_port;
+				break;
+			case IPPROTO_TCP:
+				l4.tcp = rte_pktmbuf_mtod_offset(
+					m, const struct rte_tcp_hdr *, l3_offset + sizeof(*l3.ip6)
+				);
+				tuple.v6.sport = l4.tcp->src_port;
+				tuple.v6.dport = l4.tcp->dst_port;
+				break;
+			}
 		}
 		len = sizeof(tuple.v6);
 		break;
